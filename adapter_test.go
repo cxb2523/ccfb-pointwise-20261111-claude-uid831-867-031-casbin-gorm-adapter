@@ -1286,3 +1286,355 @@ func TestNewTransactionalAdapterConstructors(t *testing.T) {
 	assert.NotNil(t, txContext2)
 	txContext2.Rollback() // Clean up
 }
+
+// newSQLiteInMemoryAdapter opens an adapter backed by a shared-cache in-memory
+// SQLite database. The shared cache (equivalently a single connection) makes
+// sure the table created by NewAdapterByDB is visible from inside transactions.
+func newSQLiteInMemoryAdapter(t *testing.T) *Adapter {
+	t.Helper()
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		_ = sqlDB.Close()
+	})
+
+	a, err := NewAdapterByDB(db)
+	require.NoError(t, err)
+	return a
+}
+
+func makeCasbinRule(v0, v1, v2 string) CasbinRule {
+	return CasbinRule{Ptype: "p", V0: v0, V1: v1, V2: v2}
+}
+
+// seedCasbinRules inserts rules in batches, keeping every INSERT below the
+// SQLite 999 variable limit (7 unique-index columns per row).
+func seedCasbinRules(t *testing.T, a *Adapter, rules []CasbinRule) {
+	t.Helper()
+	for start := 0; start < len(rules); start += updatePoliciesBatchSize {
+		end := start + updatePoliciesBatchSize
+		if end > len(rules) {
+			end = len(rules)
+		}
+		batch := rules[start:end]
+		require.NoError(t, a.db.Create(&batch).Error)
+	}
+}
+
+func loadAllCasbinRules(t *testing.T, a *Adapter) []CasbinRule {
+	t.Helper()
+	var lines []CasbinRule
+	require.NoError(t, a.db.Order("id").Find(&lines).Error)
+	return lines
+}
+
+// casbinRuleSet counts occurrences of each rule on the unique-index columns.
+func casbinRuleSet(lines []CasbinRule) map[ruleKey]int {
+	set := make(map[ruleKey]int, len(lines))
+	for _, line := range lines {
+		set[ruleKeyOf(line)]++
+	}
+	return set
+}
+
+func stringRules(lines ...CasbinRule) [][]string {
+	rules := make([][]string, 0, len(lines))
+	for _, line := range lines {
+		rules = append(rules, []string{line.V0, line.V1, line.V2})
+	}
+	return rules
+}
+
+// TestUpdatePoliciesSQLiteNormal covers the ordinary case: every old rule
+// exists and the new rules neither swap keys nor collide with anything.
+func TestUpdatePoliciesSQLiteNormal(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	seed := []CasbinRule{
+		makeCasbinRule("alice", "data1", "read"),
+		makeCasbinRule("bob", "data2", "write"),
+		makeCasbinRule("carol", "data3", "read"),
+	}
+	seedCasbinRules(t, a, seed)
+
+	oldRules := stringRules(seed[0], seed[1])
+	newRules := stringRules(
+		makeCasbinRule("alice", "data1", "write"),
+		makeCasbinRule("bob", "data2", "read"),
+	)
+	require.NoError(t, a.UpdatePolicies("p", "p", oldRules, newRules))
+
+	got := casbinRuleSet(loadAllCasbinRules(t, a))
+	expected := casbinRuleSet([]CasbinRule{
+		makeCasbinRule("alice", "data1", "write"),
+		makeCasbinRule("bob", "data2", "read"),
+		makeCasbinRule("carol", "data3", "read"),
+	})
+	assert.Equal(t, expected, got)
+}
+
+// TestUpdatePoliciesSQLiteSwap covers two rules swapping field values. A
+// row-by-row UPDATE would hit the unique index on the first statement even
+// though the final state is conflict-free, so delete-then-insert is required.
+func TestUpdatePoliciesSQLiteSwap(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	ruleA := makeCasbinRule("alice", "data1", "read")
+	ruleB := makeCasbinRule("alice", "data2", "read")
+	seedCasbinRules(t, a, []CasbinRule{ruleA, ruleB})
+
+	// Swap v1 between the two rows, including a three-way cyclic swap.
+	oldRules := stringRules(ruleA, ruleB)
+	newRules := stringRules(
+		makeCasbinRule("alice", "data2", "read"),
+		makeCasbinRule("alice", "data1", "read"),
+	)
+	require.NoError(t, a.UpdatePolicies("p", "p", oldRules, newRules))
+	assert.Equal(t,
+		casbinRuleSet([]CasbinRule{
+			makeCasbinRule("alice", "data2", "read"),
+			makeCasbinRule("alice", "data1", "read"),
+		}),
+		casbinRuleSet(loadAllCasbinRules(t, a)),
+	)
+
+	// A new rule introduced by the swap may temporarily equal a not-yet-deleted
+	// old rule; run a second swap where a new key equals another row's old key.
+	ruleC := makeCasbinRule("alice", "data3", "read")
+	seedCasbinRules(t, a, []CasbinRule{ruleC})
+	oldRules = stringRules(
+		makeCasbinRule("alice", "data1", "read"),
+		makeCasbinRule("alice", "data2", "read"),
+		makeCasbinRule("alice", "data3", "read"),
+	)
+	newRules = stringRules(
+		makeCasbinRule("alice", "data2", "read"),
+		makeCasbinRule("alice", "data3", "read"),
+		makeCasbinRule("alice", "data1", "read"),
+	)
+	require.NoError(t, a.UpdatePolicies("p", "p", oldRules, newRules))
+	assert.Equal(t,
+		casbinRuleSet([]CasbinRule{
+			makeCasbinRule("alice", "data2", "read"),
+			makeCasbinRule("alice", "data3", "read"),
+			makeCasbinRule("alice", "data1", "read"),
+		}),
+		casbinRuleSet(loadAllCasbinRules(t, a)),
+	)
+}
+
+// TestUpdatePoliciesSQLiteDuplicateOldRules feeds the same old rule twice.
+// The delete must be verified against the de-duplicated count, otherwise the
+// second delete's zero RowsAffected is mistaken for a missing rule.
+func TestUpdatePoliciesSQLiteDuplicateOldRules(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	ruleX := makeCasbinRule("alice", "data1", "read")
+	ruleY := makeCasbinRule("bob", "data2", "write")
+	seedCasbinRules(t, a, []CasbinRule{ruleX, ruleY})
+
+	oldRules := [][]string{
+		{"alice", "data1", "read"},
+		{"alice", "data1", "read"}, // duplicated inside the batch
+		{"bob", "data2", "write"},
+	}
+	newRules := stringRules(
+		makeCasbinRule("alice", "data1", "write"),
+		makeCasbinRule("alice", "data4", "read"),
+		makeCasbinRule("bob", "data2", "read"),
+	)
+	require.NoError(t, a.UpdatePolicies("p", "p", oldRules, newRules))
+
+	assert.Equal(t,
+		casbinRuleSet([]CasbinRule{
+			makeCasbinRule("alice", "data1", "write"),
+			makeCasbinRule("alice", "data4", "read"),
+			makeCasbinRule("bob", "data2", "read"),
+		}),
+		casbinRuleSet(loadAllCasbinRules(t, a)),
+	)
+}
+
+// TestUpdatePoliciesSQLiteMissingOldRuleRollback checks that an old rule that
+// does not really exist makes the RowsAffected verification fail and the whole
+// transaction roll back.
+func TestUpdatePoliciesSQLiteMissingOldRuleRollback(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	ruleX := makeCasbinRule("alice", "data1", "read")
+	seedCasbinRules(t, a, []CasbinRule{ruleX})
+	before := casbinRuleSet(loadAllCasbinRules(t, a))
+
+	oldRules := stringRules(
+		ruleX,
+		makeCasbinRule("ghost", "data9", "read"), // not in the table
+	)
+	newRules := stringRules(
+		makeCasbinRule("alice", "data1", "write"),
+		makeCasbinRule("ghost", "data9", "write"),
+	)
+	err := a.UpdatePolicies("p", "p", oldRules, newRules)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "do not exist")
+
+	// Nothing changed: the existing rule is untouched and no new row leaked in.
+	assert.Equal(t, before, casbinRuleSet(loadAllCasbinRules(t, a)))
+}
+
+// TestUpdatePoliciesSQLiteConflictExternalRollback checks that a new rule
+// colliding with a row outside the batch surfaces the unique-index error
+// instead of being swallowed, and rolls the transaction back.
+func TestUpdatePoliciesSQLiteConflictExternalRollback(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	ruleX := makeCasbinRule("alice", "data1", "read")
+	external := makeCasbinRule("ext", "datax", "read")
+	seedCasbinRules(t, a, []CasbinRule{ruleX, external})
+	before := casbinRuleSet(loadAllCasbinRules(t, a))
+
+	oldRules := stringRules(ruleX)
+	newRules := stringRules(external) // already stored, not part of the deletes
+	err := a.UpdatePolicies("p", "p", oldRules, newRules)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UNIQUE constraint")
+
+	assert.Equal(t, before, casbinRuleSet(loadAllCasbinRules(t, a)))
+}
+
+// TestUpdatePoliciesSQLiteSelfDuplicateNewRulesRollback checks that duplicated
+// new rules are not silently de-duplicated: the unique-index error propagates.
+func TestUpdatePoliciesSQLiteSelfDuplicateNewRulesRollback(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	ruleX := makeCasbinRule("alice", "data1", "read")
+	ruleY := makeCasbinRule("bob", "data2", "write")
+	seedCasbinRules(t, a, []CasbinRule{ruleX, ruleY})
+	before := casbinRuleSet(loadAllCasbinRules(t, a))
+
+	oldRules := stringRules(ruleX, ruleY)
+	dup := makeCasbinRule("carol", "data3", "read")
+	newRules := stringRules(dup, dup) // self-duplicated inside the batch
+	err := a.UpdatePolicies("p", "p", oldRules, newRules)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UNIQUE constraint")
+
+	assert.Equal(t, before, casbinRuleSet(loadAllCasbinRules(t, a)))
+}
+
+// TestUpdatePoliciesSQLiteLargeBatch rewrites 1200 rules, which spans multiple
+// delete/insert batches (140 rows each) while staying inside one transaction.
+func TestUpdatePoliciesSQLiteLargeBatch(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	const n = 1200
+	seed := make([]CasbinRule, 0, n)
+	for i := 0; i < n; i++ {
+		seed = append(seed, makeCasbinRule(
+			fmt.Sprintf("user%04d", i),
+			fmt.Sprintf("data%04d", i),
+			"read",
+		))
+	}
+	seedCasbinRules(t, a, seed)
+	require.Len(t, loadAllCasbinRules(t, a), n)
+
+	oldRules := make([][]string, 0, n)
+	newRules := make([][]string, 0, n)
+	expected := make(map[ruleKey]int, n)
+	for i := 0; i < n; i++ {
+		oldRules = append(oldRules, []string{fmt.Sprintf("user%04d", i), fmt.Sprintf("data%04d", i), "read"})
+		newLine := makeCasbinRule(fmt.Sprintf("user%04d", i), fmt.Sprintf("data%04d", i), "write")
+		newRules = append(newRules, []string{newLine.V0, newLine.V1, newLine.V2})
+		expected[ruleKeyOf(newLine)]++
+	}
+
+	require.NoError(t, a.UpdatePolicies("p", "p", oldRules, newRules))
+
+	got := casbinRuleSet(loadAllCasbinRules(t, a))
+	assert.Equal(t, expected, got)
+}
+
+// TestUpdatePoliciesSQLiteLargeBatchConflictRollback makes the last insert
+// batch of a 1200-rule update collide with an externally stored rule. Earlier
+// batches must roll back together with the failing one.
+func TestUpdatePoliciesSQLiteLargeBatchConflictRollback(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	const n = 1200
+	seed := make([]CasbinRule, 0, n)
+	oldRules := make([][]string, 0, n)
+	for i := 0; i < n; i++ {
+		line := makeCasbinRule(fmt.Sprintf("user%04d", i), fmt.Sprintf("data%04d", i), "read")
+		seed = append(seed, line)
+		oldRules = append(oldRules, []string{line.V0, line.V1, line.V2})
+	}
+	external := makeCasbinRule("ext", "datax", "read")
+	seedCasbinRules(t, a, append(seed, external))
+	before := casbinRuleSet(loadAllCasbinRules(t, a))
+
+	newRules := make([][]string, 0, n)
+	for i := 0; i < n; i++ {
+		newRules = append(newRules, []string{fmt.Sprintf("user%04d", i), fmt.Sprintf("data%04d", i), "write"})
+	}
+	// The colliding row lands in the final insert batch (1200 = 8*140 + 80).
+	newRules[n-1] = []string{external.V0, external.V1, external.V2}
+
+	err := a.UpdatePolicies("p", "p", oldRules, newRules)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UNIQUE constraint")
+
+	// Full rollback: all original rows survive, the external row is still
+	// unique and none of the new rows were persisted.
+	assert.Equal(t, before, casbinRuleSet(loadAllCasbinRules(t, a)))
+}
+
+// TestUpdatePoliciesSQLiteEmptyAndMismatchedInputs covers the empty-input
+// degradation and the pre-transaction length check.
+func TestUpdatePoliciesSQLiteEmptyAndMismatchedInputs(t *testing.T) {
+	a := newSQLiteInMemoryAdapter(t)
+
+	ruleX := makeCasbinRule("alice", "data1", "read")
+	ruleY := makeCasbinRule("bob", "data2", "write")
+	seedCasbinRules(t, a, []CasbinRule{ruleX, ruleY})
+
+	// Both empty: no-op.
+	require.NoError(t, a.UpdatePolicies("p", "p", nil, nil))
+	assert.Len(t, loadAllCasbinRules(t, a), 2)
+
+	// Empty old rules: degrade to pure insertion.
+	insertOnly := stringRules(
+		makeCasbinRule("carol", "data3", "read"),
+		makeCasbinRule("dave", "data4", "write"),
+	)
+	require.NoError(t, a.UpdatePolicies("p", "p", nil, insertOnly))
+	assert.Len(t, loadAllCasbinRules(t, a), 4)
+
+	// Empty new rules: degrade to pure deletion.
+	require.NoError(t, a.UpdatePolicies("p", "p", stringRules(ruleX, ruleY), nil))
+	assert.Equal(t,
+		casbinRuleSet(stringRulesToLines(insertOnly)),
+		casbinRuleSet(loadAllCasbinRules(t, a)),
+	)
+
+	// Both sides non-empty with different lengths: error before opening a
+	// transaction, and the table stays untouched.
+	before := casbinRuleSet(loadAllCasbinRules(t, a))
+	err := a.UpdatePolicies("p", "p",
+		[][]string{{"carol", "data3", "read"}},
+		[][]string{{"carol", "data3", "write"}, {"dave", "data4", "read"}},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "same length")
+	assert.Equal(t, before, casbinRuleSet(loadAllCasbinRules(t, a)))
+}
+
+func stringRulesToLines(rules [][]string) []CasbinRule {
+	lines := make([]CasbinRule, 0, len(rules))
+	for _, rule := range rules {
+		lines = append(lines, makeCasbinRule(rule[0], rule[1], rule[2]))
+	}
+	return lines
+}

@@ -89,8 +89,9 @@ type Adapter struct {
 }
 
 var (
-	_ persist.Adapter      = (*Adapter)(nil)
-	_ persist.BatchAdapter = (*Adapter)(nil)
+	_ persist.Adapter          = (*Adapter)(nil)
+	_ persist.BatchAdapter     = (*Adapter)(nil)
+	_ persist.UpdatableAdapter = (*Adapter)(nil)
 )
 
 // finalizer is the destructor for Adapter.
@@ -1024,23 +1025,120 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 	return a.db.Model(&oldLine).Where(&oldLine).Updates(newLine).Error
 }
 
+// sqlite 单条 SQL 的变量上限为 999，CasbinRule 的唯一键由 7 个列组成，
+// 因此删除/插入都按每个批次最多 140 行切分，保证单条 SQL 的占位符数量低于上限。
+// 切分只影响单条 SQL 的行数，所有批次仍在同一个事务内执行，不破坏原子性。
+const updatePoliciesBatchSize = 140
+
+// ruleKey 以唯一索引列（ptype,v0..v5）的组合作为规则的去重键。
+type ruleKey struct {
+	Ptype string
+	V0    string
+	V1    string
+	V2    string
+	V3    string
+	V4    string
+	V5    string
+}
+
+func ruleKeyOf(line CasbinRule) ruleKey {
+	return ruleKey{line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5}
+}
+
+// UpdatePolicies 批量更新策略规则，整批操作在同一个数据库事务内完成，全成或全败。
+//
+// 表上存在 (ptype,v0..v5) 唯一索引，逐条 UPDATE 在同批两条规则互换字段值时
+// 会因中间态撞唯一键而失败，因此事务内统一走“先全部删除、再全部插入”：
+//   - oldRules 先按唯一键去重，删除按去重后的规则分批执行，并按去重条数核对
+//     RowsAffected，避免批内重复规则第二次删除影响 0 行被误判为不存在；
+//   - 所有删除批次完成后才开始插入，防止某条 newRule 恰好等于尚未删除的
+//     oldRule 时误撞唯一键；
+//   - newRules 不做去重，自重复或与批外存量冲突时唯一键错误直接向上抛出回滚。
+//
+// 入参一边为空时退化为纯插入（oldRules 为空）或纯删除（newRules 为空），
+// 两边均为空时空操作返回；两边都非空且长度不一致时，在开启事务之前直接报错。
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
+	// 两边都为空是空操作；仅一边为空时退化为纯插入或纯删除。
+	// 两边都有数据时长度必须一致，且在开启事务之前直接报错。
+	if len(oldRules) == 0 && len(newRules) == 0 {
+		return nil
+	}
+	if len(oldRules) != 0 && len(newRules) != 0 && len(oldRules) != len(newRules) {
+		return errors.Errorf("oldRules and newRules must have the same length, got %d and %d", len(oldRules), len(newRules))
+	}
+
 	oldPolicies := make([]CasbinRule, 0, len(oldRules))
-	newPolicies := make([]CasbinRule, 0, len(oldRules))
-	for _, oldRule := range oldRules {
-		oldPolicies = append(oldPolicies, a.savePolicyLine(ptype, oldRule))
+	newPolicies := make([]CasbinRule, 0, len(newRules))
+	for _, rule := range oldRules {
+		oldPolicies = append(oldPolicies, a.savePolicyLine(ptype, rule))
 	}
-	for _, newRule := range newRules {
-		newPolicies = append(newPolicies, a.savePolicyLine(ptype, newRule))
+	for _, rule := range newRules {
+		newPolicies = append(newPolicies, a.savePolicyLine(ptype, rule))
 	}
-	tx := a.db.Begin()
-	for i := range oldPolicies {
-		if err := tx.Model(&oldPolicies[i]).Where(&oldPolicies[i]).Updates(newPolicies[i]).Error; err != nil {
-			tx.Rollback()
-			return err
+
+	// oldRules 批内可能重复，先按唯一键去重：重复规则只删一次，
+	// 核对也以去重后的条数为准，否则第二次删除影响 0 行会被误判为规则不存在。
+	seen := make(map[ruleKey]struct{}, len(oldPolicies))
+	uniqueOldPolicies := make([]CasbinRule, 0, len(oldPolicies))
+	for _, line := range oldPolicies {
+		key := ruleKeyOf(line)
+		if _, ok := seen[key]; ok {
+			continue
 		}
+		seen[key] = struct{}{}
+		uniqueOldPolicies = append(uniqueOldPolicies, line)
 	}
-	return tx.Commit().Error
+
+	return a.db.Transaction(func(tx *gorm.DB) error {
+		// 阶段一：分批删除全部旧规则。所有删除批次必须在插入之前跑完，
+		// 否则某条 newRule 等于未删除的 oldRule 时会误撞唯一键。
+		deleted := int64(0)
+		for start := 0; start < len(uniqueOldPolicies); start += updatePoliciesBatchSize {
+			end := start + updatePoliciesBatchSize
+			if end > len(uniqueOldPolicies) {
+				end = len(uniqueOldPolicies)
+			}
+			batch := uniqueOldPolicies[start:end]
+
+			// 把一个批次拼成单条 DELETE：每条规则是一个全列等值谓词，用 OR 连接。
+			// 空串列也必须显式参与匹配，否则会误删仅尾部字段不同的其他规则。
+			// 每行 7 个占位符，配合 updatePoliciesBatchSize 保证不超过 SQLite 的 999 上限。
+			whereParts := make([]string, 0, len(batch))
+			args := make([]interface{}, 0, len(batch)*7)
+			for _, line := range batch {
+				whereParts = append(whereParts, "(ptype = ? AND v0 = ? AND v1 = ? AND v2 = ? AND v3 = ? AND v4 = ? AND v5 = ?)")
+				args = append(args, line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5)
+			}
+
+			result := tx.Exec(
+				fmt.Sprintf("DELETE FROM %s WHERE %s", a.getFullTableName(), strings.Join(whereParts, " OR ")),
+				args...,
+			)
+			if result.Error != nil {
+				return result.Error
+			}
+			deleted += result.RowsAffected
+		}
+
+		// 按去重后的旧规则条数核对：真有规则不存在时整体回滚。
+		if deleted != int64(len(uniqueOldPolicies)) {
+			return errors.Errorf("update policies failed: expected to delete %d old rules but %d were affected, some rules do not exist", len(uniqueOldPolicies), deleted)
+		}
+
+		// 阶段二：分批插入全部新规则。不挂 OnConflict 等吞错子句，
+		// newRules 自重复或与批外存量撞唯一键时错误直接抛出并回滚整个事务。
+		for start := 0; start < len(newPolicies); start += updatePoliciesBatchSize {
+			end := start + updatePoliciesBatchSize
+			if end > len(newPolicies) {
+				end = len(newPolicies)
+			}
+			batch := newPolicies[start:end]
+			if err := tx.Create(&batch).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
